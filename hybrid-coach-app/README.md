@@ -149,3 +149,5 @@ but the single-blob approach is the simplest way to be live today.
 - **"Missing Supabase env vars" in the console** → you didn't create `.env` (Step 5), or on Vercel you didn't add the env vars (Step 7.3). Env vars must start with `VITE_`.
 - **Sign-in does nothing / redirect error with Google** → the Site URL / Redirect URLs in Supabase (Step 8) don't match where the app is actually running.
 - **Data doesn't persist** → make sure you ran `supabase/schema.sql` (Step 3) and that RLS policies were created.
+
+- 
