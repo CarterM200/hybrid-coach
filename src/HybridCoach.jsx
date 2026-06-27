@@ -223,6 +223,18 @@ const HR_ZONE_COLOR = { Z1: "#4F86F7", Z2: "#22D3EE", Z3: "#A3E635", Z4: "#FB923
 const hrColor = (zone) => HR_ZONE_COLOR[zone] || "#22D3EE";
 function hrZoneFor(type, maxHr) { const z = HR_ZONE[type]; if (!z) return null; return { zone: z[0], lo: Math.round(maxHr * z[1]), hi: Math.round(maxHr * z[2]) }; }
 
+// PLANNED strength load (phase-based, in the same TSS-like units as the run loads above),
+// used for projected/future and unlogged days. A heavy build-phase lift is genuinely
+// fatiguing - more than an easy run, less than a tempo - so the fatigue model (CTL/ATL/TSB)
+// sees it instead of a flat, near-neutral 45. Phase sets the intensity; deload weeks are
+// lighter. Once a session is logged, its ACTUAL e1RM-normalised volume-load (computed in
+// the StrengthLogged reducer) replaces this estimate for that day.
+const STRENGTH_LOAD = { Base: 50, Build: 55, Peak: 52, Taper: 33 };
+function strengthLoad(phase, isRecovery) {
+  if (isRecovery) return 32;
+  return STRENGTH_LOAD[phase] != null ? STRENGTH_LOAD[phase] : 45;
+}
+
 function buildWorkoutData(type, phase, longKm, recovery, maxHr, easyKm) {
   const easy = easyKm ?? EASY_KM[phase] ?? 10; const hr = hrZoneFor(type, maxHr);
   const mk = (o) => ({ type, name: o.name, distanceKm: o.dist, durationMin: o.dur, intensity: o.int, load: o.load, detail: o.detail, hrZone: hr, intervals: o.intervals || null });
@@ -234,7 +246,7 @@ function buildWorkoutData(type, phase, longKm, recovery, maxHr, easyKm) {
     case "Threshold": return mk({ name: "Threshold", dist: 12, dur: 65, int: "high", load: 108, detail: "4 x 6 min @ threshold, 90s float. Warm-up: 6 x 20 s strides, 60 s recovery", intervals: { reps: 4, mode: "time", workMin: 6, recovery: "90s float", paceZone: "Threshold" } });
     case "Double Threshold": return mk({ name: "Double threshold", dist: 18, dur: 95, int: "high", load: 165, detail: "AM: 5 x 6 min @ threshold, 60s float. PM: 10 x 1 km @ threshold, 60s jog. Keep both controlled - sub-threshold by feel/HR, never race the reps. Refuel between sessions. Warm-up each: 6 x 20 s strides", intervals: { reps: 5, mode: "time", workMin: 6, recovery: "60s float", paceZone: "Threshold", am: "5 x 6 min @ threshold, 60s float", pm: "10 x 1 km @ threshold, 60s jog" } });
     case "Intervals": return mk({ name: "VO2 intervals", dist: 10, dur: 58, int: "high", load: 100, detail: "6 x 800m @ 5k effort, equal recovery. Warm-up: 6 x 20 s strides, 60 s recovery", intervals: { reps: 6, mode: "dist", workM: 800, recovery: "equal recovery", paceZone: "Interval (VO2)" } });
-    case "Strength": return mk({ name: "Strength", dist: 0, dur: 55, int: "moderate", load: 45, detail: "3 prehab - 2 compound - 4 accessory" });
+    case "Strength": return mk({ name: "Strength", dist: 0, dur: 55, int: "moderate", load: strengthLoad(phase, recovery), detail: "4 prehab - 2 compound - 4 accessory" });
     case "Long Run": return mk({ name: recovery ? "Long run (reduced)" : "Long run", dist: longKm, dur: Math.round(longKm * 6.2), int: phase === "Peak" ? "high" : "moderate", load: Math.round(longKm * 6), detail: phase === "Peak" || phase === "Build" ? "Progressive: last third at marathon effort" : "Steady aerobic endurance" });
     case "Race": { const km = longKm && longKm > 0 ? Math.round(longKm * 10) / 10 : 42.2; const label = km >= 42 ? "Marathon" : km >= 21 ? "Half Marathon" : km >= 10 ? "10K" : km >= 5 ? "5K" : `${km}km`; return mk({ name: `${label} - Race Day`, dist: km, dur: Math.round(km * 5), int: "high", load: Math.round(km * 7.6), detail: "Execute race plan. Fuel early and often." }); }
     case "Travel": return mk({ name: "Travel / easy", dist: 5, dur: 30, int: "low", load: 20, detail: "Holiday - keep it easy" });
@@ -255,7 +267,14 @@ function weekSessions(phase, recovery, split, methodology) {
   const easyCount = Math.max(0, f.runs - 1 - qCount);
   const easies = Array(easyCount).fill("Easy Run");
   if (easyCount >= 1 && phase !== "Taper") easies[easies.length - 1] = "Recovery Run";
-  return [...used, ...easies, ...Array(f.lifts).fill("Strength")];
+  // Phase-aware strength frequency: build 2-3x, but drop to a protected maintenance
+  // dose into the race (Peak <=2, Taper 1) so the heavy stimulus is kept but not piled
+  // on top of peak running. Never below 1 if the athlete lifts at all.
+  let liftsN = f.lifts;
+  if (phase === "Taper") liftsN = Math.min(liftsN, 1);
+  else if (phase === "Peak") liftsN = Math.min(liftsN, 2);
+  if (f.lifts >= 1) liftsN = Math.max(1, liftsN);
+  return [...used, ...easies, ...Array(liftsN).fill("Strength")];
 }
 // Unique permutations of a (possibly duplicated) array
 function uniquePerms(arr) {
@@ -487,13 +506,13 @@ function weekFor(plan, dateISO) { if (dateISO < plan.weeks[0].startDate) return 
 
 /* ---- STRENGTH ENGINE ---- */
 function strengthScheme(phase) {
-  switch (phase) { case "Base": return { sets: 4, reps: 6, pct: 0.72, label: "Hypertrophy" }; case "Build": return { sets: 4, reps: 4, pct: 0.82, label: "Strength" }; case "Peak": return { sets: 3, reps: 3, pct: 0.85, label: "Maintenance" }; case "Taper": return { sets: 2, reps: 3, pct: 0.70, label: "Primer" }; default: return { sets: 3, reps: 5, pct: 0.75, label: "General" }; }
+  switch (phase) { case "Base": return { sets: 4, reps: 6, pct: 0.72, label: "Hypertrophy", rir: 3 }; case "Build": return { sets: 4, reps: 4, pct: 0.82, label: "Strength", rir: 2 }; case "Peak": return { sets: 3, reps: 3, pct: 0.85, label: "Maintenance", rir: 1 }; case "Taper": return { sets: 2, reps: 3, pct: 0.70, label: "Primer", rir: 3 }; default: return { sets: 3, reps: 5, pct: 0.75, label: "General", rir: 2 }; }
 }
 // Accessory swap options, grouped by movement category so a swap always matches
 // the same pattern (e.g. a Lat Pulldown can replace a Weighted Pull-up - both
 // vertical pulls). The first entry is the default prescription.
 const EXERCISE_ALTS = {
-  "glute-hinge": ["Hip Thrust", "Single-leg Hip Thrust", "Glute Bridge", "Back Extension", "Good Morning"],
+  "glute-hinge": ["Hip Thrust", "Trap-bar Deadlift", "Single-leg Hip Thrust", "Glute Bridge", "Back Extension", "Good Morning"],
   "lunge": ["Bulgarian Split Squat", "Walking Lunge", "Reverse Lunge", "Step-up", "Split Squat"],
   "vertical-pull": ["Weighted Pull-up", "Lat Pulldown", "Chin-up", "Assisted Pull-up", "Neutral-grip Pulldown"],
   "horizontal-push": ["Incline DB Press", "Flat DB Press", "Weighted Push-up", "Dips", "Machine Chest Press"],
@@ -504,7 +523,7 @@ const EXERCISE_ALTS = {
 // linear progression (+2.5 kg upper body / +5 kg lower body) rather than guessing a
 // percentage of a compound 1RM (which tends to prescribe far too much).
 const ACCESSORY_START = {
-  "Hip Thrust": 40, "Single-leg Hip Thrust": 16, "Glute Bridge": 30, "Back Extension": 5, "Good Morning": 30,
+  "Hip Thrust": 40, "Trap-bar Deadlift": 60, "Single-leg Hip Thrust": 16, "Glute Bridge": 30, "Back Extension": 5, "Good Morning": 30,
   "Bulgarian Split Squat": 12, "Walking Lunge": 12, "Reverse Lunge": 12, "Step-up": 12, "Split Squat": 12,
   "Weighted Pull-up": 0, "Lat Pulldown": 35, "Chin-up": 0, "Assisted Pull-up": 0, "Neutral-grip Pulldown": 35,
   "Incline DB Press": 16, "Flat DB Press": 18, "Weighted Push-up": 0, "Dips": 0, "Machine Chest Press": 30,
@@ -519,35 +538,67 @@ function liftIncrement(name) {
   for (const cat in EXERCISE_ALTS) if (EXERCISE_ALTS[cat].includes(name)) return LOWER_CATS.includes(cat) ? 5 : 2.5;
   return 2.5;
 }
-// sessionParity 0 -> Session A (Deadlift + Bench), 1 -> Session B (Squat + OHP).
+// sessionIdx cycles three complementary templates (A/B/C) across a week of strength
+// days so a 2-3 lift week covers every barbell compound (squat, hinge, vertical &
+// horizontal push) plus pull, single-leg and core.
 // Compounds are prescribed off your 1RM and PROGRESS week to week: a 4-week wave
-// (+2.5% per week, deload on the 4th) on top of a 1RM that itself rises as you log
-// PRs - so the bar keeps moving and you never stagnate. Accessories use the last
-// working weight (no 1RM), advancing +2.5/+5 kg when you complete everything.
-function generateStrengthSession(profile, weekNumber, phase, isRecovery, sessionIdx = 0, weights = {}) {
+// (+2.5%/week, deload on the recovery week) on top of a 1RM that itself rises as you
+// log PRs. They also AUTOREGULATE: poor recovery trims load and a set and loosens the
+// rep-in-reserve (RIR) target. Accessories use double progression - work up reps
+// within the prescribed range, then add load (+2.5 upper / +5 lower). Plyometrics are
+// only programmed when the athlete can absorb them (base/build, fresh, away from races).
+function generateStrengthSession(profile, weekNumber, phase, isRecovery, sessionIdx = 0, weights = {}, opts = {}) {
   const rm = profile.oneRM, scheme = strengthScheme(phase);
+  const readiness = opts.readiness != null ? opts.readiness : 100;
+  const weeksToRace = opts.weeksToRace != null ? opts.weeksToRace : 99;
+  const lowRdy = readiness < 50, cautionRdy = readiness >= 50 && readiness < 65;
   const waveWeek = (weekNumber - 1) % 4; let overload = 1 + waveWeek * 0.025; if (isRecovery) overload = 0.9;
-  // Three complementary sessions. Cycling A/B/C across a week of strength days makes a
-  // 2- or 3-lift week cover every barbell compound (squat, hinge, horizontal & vertical
-  // push) plus pull, single-leg and core - and no two sessions in a week are identical.
+  // Plyometrics load tendons hard - only when fresh, in base/build, not deloading,
+  // and not inside the final fortnight before a race.
+  const plyoAllowed = (phase === "Base" || phase === "Build" || phase === "General" || !phase) && !isRecovery && readiness >= 50 && weeksToRace > 2;
+  // Each template defines 4 prehab slots (2 sets each): a plyometric (gated), an
+  // ISOMETRIC (always present), an injury-prevention lift, and a core/activation move.
   const TEMPLATES = [
     { label: "A",
       compound: [{ name: "Back Squat", pattern: "Squat", oneRM: rm.backSquat }, { name: "Bench Press", pattern: "Horizontal push", oneRM: rm.benchPress }],
-      acc: [{ name: "Hip Thrust", pattern: "Hinge", category: "glute-hinge", sets: 3, reps: 10, note: "glute drive" }, { name: "Bulgarian Split Squat", pattern: "Single-leg", category: "lunge", sets: 3, reps: 8, note: "per leg, DB" }, { name: "Weighted Pull-up", pattern: "Vertical pull", category: "vertical-pull", sets: 3, reps: 6, note: "added load" }, { name: "Chest-supported Row", pattern: "Horizontal pull", category: "horizontal-pull", sets: 3, reps: 12, note: "squeeze shoulder blades" }],
-      prehab: [{ name: "Pogo Hops", sets: 2, reps: 12, note: "plyometric - fast, stiff ankles, minimal ground contact", plyo: true }, { name: "Banded Glute Bridge", sets: 2, reps: 15 }, { name: "Copenhagen Plank", sets: 2, reps: "30s", note: "per side" }] },
+      acc: [{ name: "Hip Thrust", pattern: "Hinge", category: "glute-hinge", sets: 3, repsMin: 8, repsMax: 12, note: "glute drive" }, { name: "Bulgarian Split Squat", pattern: "Single-leg", category: "lunge", sets: 3, repsMin: 6, repsMax: 10, note: "per leg, DB" }, { name: "Weighted Pull-up", pattern: "Vertical pull", category: "vertical-pull", sets: 3, repsMin: 5, repsMax: 8, note: "added load" }, { name: "Chest-supported Row", pattern: "Horizontal pull", category: "horizontal-pull", sets: 3, repsMin: 8, repsMax: 12, note: "squeeze shoulder blades" }],
+      plyo: { name: "Pogo Hops", reps: 12, note: "plyometric - fast, stiff ankles, minimal ground contact", plyo: true },
+      iso: { name: "Copenhagen Plank", reps: "30s", note: "per side - adductor strength", iso: true },
+      injury: { name: "Nordic Hamstring Curl", reps: 6, note: "lower slowly - hamstring injury prevention", injury: true },
+      core: { name: "Banded Glute Bridge", reps: 15, note: "glute activation" },
+      isoAlt: { name: "Wall Sit", reps: "40s", note: "isometric quad - low-impact alternative to jumps", iso: true } },
     { label: "B",
       compound: [{ name: "Romanian Deadlift", pattern: "Hinge", oneRM: rm.romanianDeadlift }, { name: "Overhead Press", pattern: "Vertical push", oneRM: rm.overheadPress }],
-      acc: [{ name: "Walking Lunge", pattern: "Single-leg", category: "lunge", sets: 3, reps: 10, note: "per leg, DB" }, { name: "Dips", pattern: "Horizontal push", category: "horizontal-push", sets: 3, reps: 8, note: "bodyweight + added load" }, { name: "Lat Pulldown", pattern: "Vertical pull", category: "vertical-pull", sets: 3, reps: 10, note: "controlled" }, { name: "Barbell Row", pattern: "Horizontal pull", category: "horizontal-pull", sets: 3, reps: 10, note: "flat back, pull to lower ribs" }],
-      prehab: [{ name: "Box Jumps", sets: 2, reps: 6, note: "plyometric - soft landing, step down between reps", plyo: true }, { name: "Dead Bug", sets: 2, reps: 12, note: "per side" }, { name: "Side Plank", sets: 2, reps: "30s", note: "per side" }] },
+      acc: [{ name: "Walking Lunge", pattern: "Single-leg", category: "lunge", sets: 3, repsMin: 8, repsMax: 12, note: "per leg, DB" }, { name: "Dips", pattern: "Horizontal push", category: "horizontal-push", sets: 3, repsMin: 6, repsMax: 10, note: "bodyweight + added load" }, { name: "Lat Pulldown", pattern: "Vertical pull", category: "vertical-pull", sets: 3, repsMin: 8, repsMax: 12, note: "controlled" }, { name: "Barbell Row", pattern: "Horizontal pull", category: "horizontal-pull", sets: 3, repsMin: 8, repsMax: 10, note: "flat back, pull to lower ribs" }],
+      plyo: { name: "Box Jumps", reps: 6, note: "plyometric - soft landing, step down between reps", plyo: true },
+      iso: { name: "Side Plank", reps: "30s", note: "per side", iso: true },
+      injury: { name: "Single-leg Calf Raise", reps: 12, note: "slow 3s lower - Achilles & soleus", injury: true },
+      core: { name: "Dead Bug", reps: 12, note: "per side" },
+      isoAlt: { name: "Spanish Squat", reps: "40s", note: "isometric quad/patellar - low-impact alternative to jumps", iso: true } },
     { label: "C",
       compound: [{ name: "Back Squat", pattern: "Squat", oneRM: rm.backSquat }, { name: "Romanian Deadlift", pattern: "Hinge", oneRM: rm.romanianDeadlift }],
-      acc: [{ name: "Incline DB Press", pattern: "Horizontal push", category: "horizontal-push", sets: 3, reps: 10, note: "per hand" }, { name: "Seated Cable Row", pattern: "Horizontal pull", category: "horizontal-pull", sets: 3, reps: 12, note: "controlled" }, { name: "Weighted Pull-up", pattern: "Vertical pull", category: "vertical-pull", sets: 3, reps: 8, note: "added load" }, { name: "Hip Thrust", pattern: "Hinge", category: "glute-hinge", sets: 3, reps: 10, note: "glute drive" }],
-      prehab: [{ name: "Pogo Hops", sets: 2, reps: 14, note: "plyometric - reactive, minimal contact", plyo: true }, { name: "Bird Dog", sets: 2, reps: 10, note: "per side" }, { name: "Hollow Hold", sets: 2, reps: "30s" }] },
+      acc: [{ name: "Incline DB Press", pattern: "Horizontal push", category: "horizontal-push", sets: 3, repsMin: 8, repsMax: 12, note: "per hand" }, { name: "Seated Cable Row", pattern: "Horizontal pull", category: "horizontal-pull", sets: 3, repsMin: 8, repsMax: 12, note: "controlled" }, { name: "Weighted Pull-up", pattern: "Vertical pull", category: "vertical-pull", sets: 3, repsMin: 6, repsMax: 10, note: "added load" }, { name: "Hip Thrust", pattern: "Hinge", category: "glute-hinge", sets: 3, repsMin: 8, repsMax: 12, note: "glute drive" }],
+      plyo: { name: "Pogo Hops", reps: 14, note: "plyometric - reactive, minimal contact", plyo: true },
+      iso: { name: "Hollow Hold", reps: "30s", note: "ribs down", iso: true },
+      injury: { name: "Nordic Hamstring Curl", reps: 6, note: "lower slowly - hamstring injury prevention", injury: true },
+      core: { name: "Bird Dog", reps: 10, note: "per side" },
+      isoAlt: { name: "Isometric Split Squat", reps: "30s", note: "per side - low-impact alternative to jumps", iso: true } },
   ];
   const tpl = TEMPLATES[((sessionIdx % 3) + 3) % 3];
-  const compound = tpl.compound.map((c) => ({ name: c.name, pattern: c.pattern, sets: scheme.sets, reps: scheme.reps, weightKg: round2_5((c.oneRM || 60) * scheme.pct * overload), pctOneRM: Math.round(scheme.pct * overload * 100) }));
-  const accessory = tpl.acc.map((a) => ({ ...a, weightKg: (weights[a.name] != null ? weights[a.name] : (ACCESSORY_START[a.name] != null ? ACCESSORY_START[a.name] : 20)) }));
-  return { scheme: scheme.label, overloadPct: Math.round((overload - 1) * 100), session: tpl.label, prehab: tpl.prehab, compound, accessory };
+  // Prehab: 4 moves x 2 sets. Slot 1 is the plyometric when allowed, otherwise a
+  // low-impact strength isometric; slot 2 is always an isometric hold.
+  const firstSlot = plyoAllowed ? tpl.plyo : tpl.isoAlt;
+  const prehab = [firstSlot, tpl.iso, tpl.injury, tpl.core].map((p) => ({ ...p, sets: 2 }));
+  // Compounds: off 1RM x wave, autoregulated to recovery (trim a set + ~10% load when low).
+  const cSets = lowRdy ? Math.max(2, scheme.sets - 1) : scheme.sets;
+  const cMul = lowRdy ? 0.9 : 1;
+  const rir = scheme.rir + (lowRdy ? 1 : 0);
+  const compound = tpl.compound.map((c) => ({ name: c.name, pattern: c.pattern, sets: cSets, reps: scheme.reps, rir, weightKg: round2_5((c.oneRM || 60) * scheme.pct * overload * cMul), pctOneRM: Math.round(scheme.pct * overload * cMul * 100) }));
+  // Accessories: double progression. reps = top of range (the +load trigger); repRange shown.
+  const accessory = tpl.acc.map((a) => ({ name: a.name, pattern: a.pattern, category: a.category, sets: a.sets, reps: a.repsMax, repRange: `${a.repsMin}-${a.repsMax}`, note: a.note, weightKg: (weights[a.name] != null ? weights[a.name] : (ACCESSORY_START[a.name] != null ? ACCESSORY_START[a.name] : 20)) }));
+  const pairingNote = "Running today too? Lift first or leave 3-6 h between sessions, and keep the run easy - never pair lifting with a hard or long run.";
+  const autoReg = lowRdy ? "Recovery is low - load and one set trimmed today; stop 2+ reps short and skip the jumps." : (cautionRdy ? "Recovery is moderate - leave a rep or two in reserve on the compounds." : null);
+  return { scheme: scheme.label, rir, overloadPct: Math.round((overload - 1) * 100), session: tpl.label, plyo: plyoAllowed, prehab, compound, accessory, pairingNote, autoReg };
 }
 
 /* ---- FITNESS + PACES ---- */
@@ -586,7 +637,7 @@ function computeTrainingLoad(plan, today, completions) {
   const start = plan.planStart, end = iso(today); let atl = 45, ctl = 48; const series = [];
   for (let d = new Date(start); iso(d) <= end; d = addDays(d, 1)) {
     const key = iso(d); const planned = dayFor(plan, key); let load = 0;
-    if (planned && key <= end) { const rec = completions[key]; if (rec) load = rec.status === "Missed" ? 0 : Math.round(planned.load * (rec.compliance ?? 1)); else load = key < end ? planned.load : 0; }
+    if (planned && key <= end) { const rec = completions[key]; if (rec) load = rec.status === "Missed" ? 0 : (rec.load != null ? rec.load : Math.round(planned.load * (rec.compliance ?? 1))); else load = key < end ? planned.load : 0; }
     ctl += (load - ctl) / 42; atl += (load - atl) / 7;
     series.push({ date: key, load, ctl: Math.round(ctl), atl: Math.round(atl), tsb: Math.round(ctl - atl) });
   }
@@ -995,7 +1046,11 @@ function deriveState(core) {
   // and completed strength sessions for accessory linear progression.
   const todaysStrengthDay = todayWorkout.type === "Strength" ? todayWorkout : null;
   const firstStrengthThisWeek = (curWeek.days || []).find((d) => d.type === "Strength" && d.session);
-  const strengthSession = (todaysStrengthDay && todaysStrengthDay.session) || (firstStrengthThisWeek && firstStrengthThisWeek.session) || generateStrengthSession(profile, curWeek.weekNumber, curWeek.phase, curWeek.isRecovery, 0, core.liftWeights || {});
+  // Today's strength session is regenerated against live recovery + race proximity so it
+  // autoregulates (load/sets/RIR) and gates plyometrics; other days keep the neutral plan.
+  const strengthSession = todaysStrengthDay
+    ? generateStrengthSession(profile, curWeek.weekNumber, curWeek.phase, curWeek.isRecovery, todaysStrengthDay.strengthIdx || 0, core.liftWeights || {}, { readiness: recovery.score, weeksToRace: weeksToRace == null ? 99 : weeksToRace })
+    : (firstStrengthThisWeek && firstStrengthThisWeek.session) || generateStrengthSession(profile, curWeek.weekNumber, curWeek.phase, curWeek.isRecovery, 0, core.liftWeights || {});
   const progress = buildProgress(plan, curWeek.weekNumber, core.liftLogs, core.bodyLogs, core.runLogs || [], vo2Logs, { weightKg: profile.weightKg, bodyFatPct: effectiveBodyFat(profile) });
   const coachReview = buildCoachReview({ phase: curWeek.phase, week: curWeek.weekNumber, weeksToRace: weeksToRace || 0, completionPct, longRunPct, hasLongRuns: longTotal > 0, vo2Trend, recovery, readiness: noRace ? { score: 0, category: "On Track" } : readiness, load, missedKey, holidayActive, isRecoveryWeek: curWeek.isRecovery, weight, shoeAlerts });
   if (noRace) { coachReview.headline = "Base training"; coachReview.focus = "No goal race set - building a consistent aerobic base. Add a race anytime to switch to a full periodised plan."; }
@@ -1078,7 +1133,7 @@ function reducer(core, action) {
       // at the target reps and weight, next time is +2.5 kg (upper) / +5 kg (lower);
       // if you miss, the weight is held. Timed exercises log time only, no weight.
       let oneRM = { ...core.profile.oneRM }; const liftLogs = [...core.liftLogs];
-      const liftWeights = { ...(core.liftWeights || {}) };
+      const liftWeights = { ...(core.liftWeights || {}) }; let vl = 0;
       const map = { "Back Squat": "backSquat", "Romanian Deadlift": "romanianDeadlift", "Bench Press": "benchPress", "Overhead Press": "overheadPress" };
       action.exercises.forEach((ex) => {
         if (ex.timed) return; // planks etc. - no weight progression
@@ -1092,9 +1147,15 @@ function reducer(core, action) {
         const best = sets.reduce((m, s) => Math.max(m, Math.round(s.weight * (1 + s.reps / 30))), 0);
         const top = sets.reduce((m, s) => (s.weight > m.weight ? s : m), sets[0]);
         const k = map[ex.name]; if (k) oneRM[k] = Math.max(oneRM[k], best);
+        const ref = (k && oneRM[k]) ? oneRM[k] : best; // compounds normalise to tracked 1RM; accessories to this session's Epley estimate
+        sets.forEach((s) => { vl += s.reps * Math.min(1.05, s.weight / ref); }); // intensity-weighted reps -> athlete-relative
         liftLogs.unshift({ id: uid(), source: "manual", exercise: ex.name, weightKg: top.weight, reps: top.reps, sets, e1rm: best, date: action.date });
       });
-      return { ...core, profile: { ...core.profile, oneRM }, liftWeights, liftLogs, sessionLogs: [{ id: uid(), source: action.source || "manual", kind: "strength", date: action.date, notes: action.notes, exercises: action.exercises }, ...core.sessionLogs], completions: { ...core.completions, [action.date]: { status: "Completed", compliance: 1, key: false } } };
+      // Objective strength load: e1RM-normalised volume-load (intensity-weighted reps),
+      // scaled to the same TSS-like units as runs and clamped so a mis-logged set can't
+      // spike fatigue. Athlete-relative - the same %1RM costs the same for any lifter.
+      const sLoad = Math.max(20, Math.min(85, Math.round(vl * 0.52)));
+      return { ...core, profile: { ...core.profile, oneRM }, liftWeights, liftLogs, sessionLogs: [{ id: uid(), source: action.source || "manual", kind: "strength", date: action.date, notes: action.notes, exercises: action.exercises }, ...core.sessionLogs], completions: { ...core.completions, [action.date]: { status: "Completed", compliance: 1, key: false, load: sLoad } } };
     }
     case "WorkoutSwap": return { ...core, overrides: { ...(core.overrides || {}), [action.a.date]: { type: action.b.type, longKm: action.b.longKm }, [action.b.date]: { type: action.a.type, longKm: action.a.longKm } } };
     case "WorkoutEdit": return { ...core, overrides: { ...(core.overrides || {}), [action.date]: { type: action.to, longKm: action.longKm } } };
@@ -1279,8 +1340,8 @@ function StrengthSessionLog({ ss, dispatch, date, units = "metric" }) {
   // upper / +5 kg lower when you complete everything). Timed moves log a timer.
   const items = [
     ...ss.prehab.map((p) => ({ group: "Prehab", color: C.teal, name: p.name, sets: p.sets, reps: p.reps, weightKg: p.weightKg || 0, presc: `${p.sets} x ${p.reps}${p.note ? " - " + p.note : ""}`, alts: null })),
-    ...ss.compound.map((c) => ({ group: "Compound", color: C.ember, name: c.name, sets: c.sets, reps: c.reps, weightKg: c.weightKg, presc: `${c.sets} x ${c.reps} @ ${uWt(c.weightKg, U)}${wtU(U)} - ${c.pctOneRM}% 1RM (${c.pattern})`, alts: null })),
-    ...ss.accessory.map((a) => ({ group: "Accessory", color: C.amber, name: a.name, sets: a.sets, reps: a.reps, weightKg: a.weightKg, presc: `${a.sets} x ${a.reps} @ ${uWt(a.weightKg, U)}${wtU(U)} - ${a.pattern}${a.note ? " - " + a.note : ""}`, alts: EXERCISE_ALTS[a.category] || null })),
+    ...ss.compound.map((c) => ({ group: "Compound", color: C.ember, name: c.name, sets: c.sets, reps: c.reps, weightKg: c.weightKg, presc: `${c.sets} x ${c.reps} @ ${uWt(c.weightKg, U)}${wtU(U)} - ${c.pctOneRM}% 1RM${c.rir != null ? ", " + c.rir + " RIR" : ""} (${c.pattern})`, alts: null })),
+    ...ss.accessory.map((a) => ({ group: "Accessory", color: C.amber, name: a.name, sets: a.sets, reps: a.reps, weightKg: a.weightKg, presc: `${a.sets} x ${a.repRange || a.reps} @ ${uWt(a.weightKg, U)}${wtU(U)} - ${a.pattern}${a.note ? " - " + a.note : ""}`, alts: EXERCISE_ALTS[a.category] || null })),
   ].map((it) => ({ ...it, timed: typeof it.reps === "string" }));
   const repNum = (r) => (typeof r === "number" ? r : (parseInt(r) || 10));
   const [ex, setEx] = useState(items.map((it) => it.timed
@@ -1295,6 +1356,7 @@ function StrengthSessionLog({ ss, dispatch, date, units = "metric" }) {
   };
   return (<Card>
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><Eyebrow>Strength session {ss.session ? "- " + ss.session : ""} - {ss.scheme}</Eyebrow></div>
+    {ss.autoReg && (<div style={{ marginTop: 8, padding: "8px 10px", background: C.amber + "1A", border: `1px solid ${C.amber}55`, borderRadius: 8, fontSize: 11.5, color: C.amber, fontWeight: 600 }}>{ss.autoReg}</div>)}
     {items.map((it, i) => { const e = ex[i]; const header = i === 0 || items[i - 1].group !== it.group; return (<div key={i}>
       {header && <div style={{ display: "flex", alignItems: "center", gap: 6, margin: "14px 0 8px" }}><span style={{ width: 7, height: 7, borderRadius: 99, background: it.color }} /><span style={{ color: it.color, fontSize: 11.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>{it.group}</span></div>}
       <div style={{ background: C.surface2, borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
@@ -1308,7 +1370,8 @@ function StrengthSessionLog({ ss, dispatch, date, units = "metric" }) {
     </div>); })}
     <div style={{ marginTop: 8 }}><Field label="Session notes" type="text" value={notes} onChange={setNotes} /></div>
     <button onClick={submit} style={btn(C.violet)}><Plus size={15} /> {done ? "Logged" : "Log strength session"}</button>
-    <div style={{ color: C.faint, fontSize: 11.5, marginTop: 8 }}>Compounds are set from your 1RM and ramp each week. Accessories use last session's weight - hit all sets & reps and they go up (+2.5 kg upper / +5 kg lower), miss and they hold. Timed moves log a duration.</div>
+    <div style={{ color: C.faint, fontSize: 11.5, marginTop: 8 }}>Compounds are set from your 1RM and ramp each week, easing off when recovery is low. Accessories use double progression - work up to the top of the rep range across sessions, then the weight goes up (+2.5 kg upper / +5 kg lower). Timed moves log a duration.</div>
+    {ss.pairingNote && <div style={{ color: C.faint, fontSize: 11, marginTop: 6 }}>{ss.pairingNote}</div>}
   </Card>);
 }
 function WorkoutDetails({ T, workout, dispatch, onBack }) {
@@ -1654,7 +1717,7 @@ function HelpView({ onBack }) {
     <Header title="Help & how it works" sub="What every part of the app does, and why" onBack={onBack} />
 
     <Sec icon={Activity} color={C.ember} title="The big idea">
-      <P>Hybrid Coach builds one joined-up plan for running <b>and</b> strength, then adapts it to what you actually do. You log runs, lifts and a daily check-in; the app recalculates your plan, paces, fuelling and race prediction from that real data. There is no rebuild button - every change you make flows through automatically.</P>
+      <P>HyCo builds one joined-up plan for running <b>and</b> strength, then adapts it to what you actually do. You log runs, lifts and a daily check-in; the app recalculates your plan, paces, fuelling and race prediction from that real data. There is no rebuild button - every change you make flows through automatically.</P>
       <P>Everything is driven by your goal race (or a steady aerobic base if you have not set one), your current fitness, and how recovered you are.</P>
     </Sec>
 
@@ -1731,7 +1794,7 @@ function HelpView({ onBack }) {
       <Term t="Taper">The pre-race reduction in volume that lets you arrive fresh and fast.</Term>
     </Card>
 
-    <div style={{ color: C.faint, fontSize: 11.5, textAlign: "center", padding: "4px 0 8px" }}>Hybrid Coach gives training guidance, not medical advice. Check with a doctor before starting a new programme, and listen to your body.</div>
+    <div style={{ color: C.faint, fontSize: 11.5, textAlign: "center", padding: "4px 0 8px" }}>HyCo gives training guidance, not medical advice. Check with a doctor before starting a new programme, and listen to your body.</div>
   </div>);
 }
 
@@ -1833,7 +1896,7 @@ function runTests() {
   ok("Current VO2 estimate computed", todayState.vo2Current > 0);
   // Strength structure
   const ss = todayState.strengthSession;
-  ok("Strength 3 prehab / 2 compound / 4 accessory", ss.prehab.length === 3 && ss.compound.length === 2 && ss.accessory.length === 4);
+  ok("Strength 4 prehab / 2 compound / 4 accessory", ss.prehab.length === 4 && ss.compound.length === 2 && ss.accessory.length === 4);
   ok("Compounds use different patterns", ss.compound[0].pattern !== ss.compound[1].pattern, `${ss.compound[0].pattern}/${ss.compound[1].pattern}`);
   // Accessory swaps offer same-pattern alternatives (prescribed lift is a member of its category)
   ok("Every accessory swap stays in the same movement pattern", ss.accessory.every((a) => a.category && Array.isArray(EXERCISE_ALTS[a.category]) && EXERCISE_ALTS[a.category].includes(a.name)));
@@ -1855,6 +1918,54 @@ function runTests() {
   ok("Every strength session includes a horizontal-pull (rows)", [ssA, ssB, ssC].every((s) => s.accessory.some((a) => a.category === "horizontal-pull")));
   ok("Across the week all 5 accessory body-part patterns are covered", new Set([...ssA.accessory, ...ssB.accessory, ...ssC.accessory].map((a) => a.category)).size === 5);
   ok("Every accessory (incl rows) has valid same-pattern swaps", [ssA, ssB, ssC].every((s) => s.accessory.every((a) => Array.isArray(EXERCISE_ALTS[a.category]) && EXERCISE_ALTS[a.category].includes(a.name))));
+  // Prehab overhaul: 4 moves x 2 sets, always an isometric; plyometrics gated by phase/recovery/race proximity
+  ok("Prehab is 4 exercises of 2 sets each", [ssA, ssB, ssC].every((s) => s.prehab.length === 4 && s.prehab.every((p) => p.sets === 2)));
+  ok("Every prehab block includes an isometric", [ssA, ssB, ssC].every((s) => s.prehab.some((p) => p.iso)));
+  ok("Plyometrics are programmed in Build when fresh & away from a race", generateStrengthSession(core.profile, 3, "Build", false, 0, {}, { readiness: 90, weeksToRace: 12 }).prehab.some((p) => p.plyo));
+  ok("Plyometrics are dropped in Peak / near a race", !generateStrengthSession(core.profile, 3, "Peak", false, 0, {}, { readiness: 90, weeksToRace: 1 }).prehab.some((p) => p.plyo));
+  ok("Low recovery removes plyo and adds a 2nd isometric", (() => { const s = generateStrengthSession(core.profile, 3, "Build", false, 0, {}, { readiness: 30 }); return !s.prehab.some((p) => p.plyo) && s.prehab.filter((p) => p.iso).length >= 2; })());
+  // Autoregulation: low recovery trims compound load + a set and loosens RIR
+  const sFresh = generateStrengthSession(core.profile, 1, "Build", false, 0, {}, { readiness: 90 });
+  const sLow = generateStrengthSession(core.profile, 1, "Build", false, 0, {}, { readiness: 30 });
+  ok("Low recovery trims compound load", sLow.compound[0].weightKg < sFresh.compound[0].weightKg);
+  ok("Low recovery drops a working set", sLow.compound[0].sets < sFresh.compound[0].sets);
+  ok("Low recovery loosens the RIR target", sLow.rir > sFresh.rir);
+  ok("Compounds carry an RIR target", sFresh.compound.every((c) => typeof c.rir === "number"));
+  // Double progression: accessories prescribe a rep range; load advances at the top
+  ok("Accessories prescribe a rep range (double progression)", ssA.accessory.every((a) => /^[0-9]+-[0-9]+$/.test(a.repRange)));
+  // Phase-aware frequency: protected maintenance dose into the race
+  ok("Taper drops to a single (protected) strength session", weekSessions("Taper", false, { runs: 5, lifts: 3 }, "Polarised").filter((t) => t === "Strength").length === 1);
+  ok("Peak caps strength at a 2x maintenance dose", weekSessions("Peak", false, { runs: 5, lifts: 3 }, "Polarised").filter((t) => t === "Strength").length === 2);
+  ok("New movements present (Nordic, calf, isometrics, trap-bar option)", EXERCISE_ALTS["glute-hinge"].includes("Trap-bar Deadlift") && [ssA, ssB, ssC].some((s) => s.prehab.some((p) => p.name === "Nordic Hamstring Curl")));
+  // Strength now feeds CTL/ATL/TSB via an sRPE-derived, phase/deload-aware load
+  ok("Strength load varies by phase (Build heavier than Taper)", buildWorkoutData("Strength", "Build", 0, false, 185).load > buildWorkoutData("Strength", "Taper", 0, false, 185).load);
+  ok("Strength deload week lifts lighter", buildWorkoutData("Strength", "Build", 0, true, 185).load < buildWorkoutData("Strength", "Build", 0, false, 185).load);
+  ok("Strength contributes to load (not a flat near-neutral 45)", buildWorkoutData("Strength", "Build", 0, false, 185).load > 45);
+  ok("Strength load stays in a sane TSS range", ["Base", "Build", "Peak", "Taper"].every((p) => { const v = buildWorkoutData("Strength", p, 0, false, 185).load; return v >= 25 && v <= 70; }));
+  ok("Strength load still below a tempo run (lifting < hard aerobic quality)", buildWorkoutData("Strength", "Build", 0, false, 185).load < buildWorkoutData("Tempo", "Build", 0, false, 185).load);
+  // Objective strength load: e1RM-normalised volume-load from the logged sets (no RPE)
+  ok("RPE machinery removed from the session", generateStrengthSession(core.profile, 3, "Build", false, 0).defaultRpe === undefined);
+  const vlSess = (sqW, accW) => ({ type: "StrengthLogged", date: "2026-02-03", exercises: [
+    { name: "Back Squat", timed: false, target: null, sets: Array.from({ length: 4 }, () => ({ weight: sqW, reps: 4 })) },
+    { name: "Hip Thrust", timed: false, target: { sets: 3, reps: 12, weightKg: accW }, sets: Array.from({ length: 3 }, () => ({ weight: accW, reps: 10 })) },
+    { name: "Walking Lunge", timed: false, target: { sets: 3, reps: 12, weightKg: 20 }, sets: Array.from({ length: 3 }, () => ({ weight: 20, reps: 10 })) },
+  ] });
+  const strongCore = { ...core, profile: { ...core.profile, oneRM: { ...core.profile.oneRM, backSquat: 200 } } };
+  const weakCore = { ...core, profile: { ...core.profile, oneRM: { ...core.profile.oneRM, backSquat: 100 } } };
+  const strongLoad = reducer(strongCore, vlSess(164, 40)).completions["2026-02-03"].load; // 82% of 200
+  const weakLoad = reducer(weakCore, vlSess(82, 40)).completions["2026-02-03"].load;      // 82% of 100
+  ok("Volume-load is athlete-relative (same %1RM -> ~same load regardless of absolute kg)", Math.abs(strongLoad - weakLoad) <= 2, `${strongLoad} vs ${weakLoad}`);
+  ok("Logged strength load is objective and in a sane TSS range", strongLoad >= 20 && strongLoad <= 85, `${strongLoad}`);
+  const bigLoad = reducer(core, { type: "StrengthLogged", date: "2026-02-03", exercises: [
+    { name: "Back Squat", timed: false, target: null, sets: Array.from({ length: 5 }, () => ({ weight: 130, reps: 5 })) },
+    { name: "Hip Thrust", timed: false, target: null, sets: Array.from({ length: 4 }, () => ({ weight: 60, reps: 12 })) },
+  ] }).completions["2026-02-03"].load;
+  const smallLoad = reducer(core, { type: "StrengthLogged", date: "2026-02-03", exercises: [
+    { name: "Back Squat", timed: false, target: null, sets: [{ weight: 130, reps: 5 }] },
+  ] }).completions["2026-02-03"].load;
+  ok("More volume -> higher logged load (reflects what you did)", bigLoad > smallLoad, `${bigLoad} vs ${smallLoad}`);
+  ok("A mis-logged monster set can't spike fatigue (load clamped)", reducer(core, { type: "StrengthLogged", date: "2026-02-03", exercises: [{ name: "Back Squat", timed: false, target: null, sets: Array.from({ length: 8 }, () => ({ weight: 500, reps: 20 })) }] }).completions["2026-02-03"].load <= 85);
+  ok("computeTrainingLoad honours a logged session's volume-load over the phase estimate", (() => { const sDay = allDays(plan).find((d) => d.type === "Strength"); if (!sDay) return true; const today = addDays(new Date(sDay.date), 6); const hard = computeTrainingLoad(plan, today, { [sDay.date]: { status: "Completed", compliance: 1, load: 80 } }); const easy = computeTrainingLoad(plan, today, { [sDay.date]: { status: "Completed", compliance: 1, load: 25 } }); return hard.ctl >= easy.ctl && hard.atl > easy.atl; })());
   // Norwegian = real double-threshold (no longer a clone of Threshold)
   ok("Norwegian programs a double-threshold day (Threshold method does not)", weekSessions("Build", false, splitFor(6), "Norwegian").includes("Double Threshold") && !weekSessions("Build", false, splitFor(6), "Threshold").includes("Double Threshold"));
   ok("Double-threshold day is heavier than single threshold and lays out AM + PM", (() => { const dt = buildWorkoutData("Double Threshold", "Build", 0, false, 185); const t = buildWorkoutData("Threshold", "Build", 0, false, 185); return dt.load > t.load && /AM/.test(dt.detail) && /PM/.test(dt.detail) && !!dt.hrZone; })());
@@ -2052,7 +2163,7 @@ function runTests() {
   ok("#2: logged run carries a unique id + source tag", (() => { const c = reducer(core, { type: "RunLogged", date: todayState.currentDate, run: { type: "Easy Run", distanceKm: 10, durationMin: 60 } }); return !!c.runLogs[0].id && c.runLogs[0].source === "manual"; })());
   ok("#2: an imported run can supply its own id/source (dedup-ready)", (() => { const c = reducer(core, { type: "RunLogged", date: todayState.currentDate, run: { id: "strava_123", source: "strava", type: "Easy Run", distanceKm: 8, durationMin: 48 } }); return c.runLogs[0].id === "strava_123" && c.runLogs[0].source === "strava"; })());
   ok("#3: saving recovery appends a dated history entry (manual still works)", (() => { const c = reducer(core, { type: "RecoverySaved", date: "2026-05-01", inputs: { hrv: 61 } }); return Array.isArray(c.recoveryLogs) && c.recoveryLogs[0].date === "2026-05-01" && c.recoveryLogs[0].hrv === 61 && c.recoveryInputs.hrv === 61; })());
-  ok("B7: each strength session includes one plyometric prehab move", (() => { const a = generateStrengthSession(core.profile, 2, "Build", false, 0); const b = generateStrengthSession(core.profile, 2, "Build", false, 1); return a.prehab.filter((p) => p.plyo).length === 1 && b.prehab.filter((p) => p.plyo).length === 1 && a.prehab.length === 3; })());
+  ok("B7: Build prehab includes one plyometric (4 moves, 2 sets)", (() => { const a = generateStrengthSession(core.profile, 2, "Build", false, 0); const b = generateStrengthSession(core.profile, 2, "Build", false, 1); return a.prehab.filter((p) => p.plyo).length === 1 && b.prehab.filter((p) => p.plyo).length === 1 && a.prehab.length === 4; })());
   // --- Goal race change auto-updates everything ---
   const newDate = iso(addDays(new Date(), 16 * 7));
   const moved = reducer(core, { type: "RaceUpdated", race: { goalTime: "3:10:00", date: newDate } });
@@ -2132,7 +2243,7 @@ export default function App({ storage = null, user = null, onSignOut = null, onC
   return (<div style={{ background: C.bg, minHeight: "100vh", color: C.text, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
     <div style={{ maxWidth: 460, margin: "0 auto", padding: "18px 16px 96px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9 }}><div style={{ width: 30, height: 30, borderRadius: 9, background: C.ember + "22", display: "flex", alignItems: "center", justifyContent: "center" }}><Activity size={17} color={C.ember} /></div><div><div style={{ fontSize: 14, fontWeight: 800, letterSpacing: -0.3 }}>Hybrid Coach</div><div style={{ fontSize: 9.5, color: C.faint, letterSpacing: 1, textTransform: "uppercase" }}>V2 - single source of truth</div></div></div>
+        <div style={{ display: "flex", alignItems: "center", gap: 9 }}><svg width={30} height={30} viewBox="0 0 36 36" fill="none" style={{ flex: "0 0 auto" }}><rect width="36" height="36" rx="9" fill={C.ember} /><path d="M8 24.5 L15.5 15.5 L20.5 20 L28 10.5" stroke="#fff" strokeWidth="3" fill="none" strokeLinecap="round" strokeLinejoin="round" /><circle cx="28" cy="10.5" r="2.5" fill="#fff" /></svg><div><div style={{ fontSize: 16, fontWeight: 800, letterSpacing: -0.4 }}>HyCo</div><div style={{ fontSize: 9.5, color: C.faint, letterSpacing: 1, textTransform: "uppercase" }}>Run. Lift. Perform.</div></div></div>
         {!needsSetup && hydrated && <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {user && user.email && <span style={{ fontSize: 11, color: C.faint, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.email}</span>}
           <button onClick={() => goTab("profile")} title="Profile" style={{ cursor: "pointer", background: C.surface, border: `1px solid ${C.line}`, borderRadius: 9, padding: 7, display: "flex" }}><User size={15} color={C.dim} /></button>
