@@ -12,8 +12,9 @@ const Shell = ({ children }) => (
   <div style={{ minHeight: "100vh", background: ink, color: text, display: "flex", alignItems: "center", justifyContent: "center", padding: 18, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
     <div style={{ width: "100%", maxWidth: 380 }}>
       <div style={{ textAlign: "center", marginBottom: 18 }}>
-        <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: -0.4 }}>Hybrid Coach</div>
-        <div style={{ fontSize: 12, color: faint, letterSpacing: 1, textTransform: "uppercase", marginTop: 4 }}>Marathon + strength coaching</div>
+        <svg width={42} height={42} viewBox="0 0 36 36" fill="none" style={{ display: "block", margin: "0 auto 10px" }}><rect width="36" height="36" rx="9" fill={ember} /><path d="M8 24.5 L15.5 15.5 L20.5 20 L28 10.5" stroke="#fff" strokeWidth="3" fill="none" strokeLinecap="round" strokeLinejoin="round" /><circle cx="28" cy="10.5" r="2.5" fill="#fff" /></svg>
+        <div style={{ fontSize: 24, fontWeight: 800, letterSpacing: -0.5 }}>HyCo</div>
+        <div style={{ fontSize: 12, color: faint, letterSpacing: 1, textTransform: "uppercase", marginTop: 4 }}>Run. Lift. Perform.</div>
       </div>
       <div style={{ background: surface, border: `1px solid ${line}`, borderRadius: 16, padding: 20 }}>{children}</div>
     </div>
