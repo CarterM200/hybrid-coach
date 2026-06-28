@@ -915,6 +915,12 @@ function buildProgress(plan, currentWeek, liftLogs, bodyLogs, runLogs = [], vo2L
   const MAIN_LIFTS = ["Back Squat", "Romanian Deadlift", "Bench Press", "Overhead Press"];
   const byLift = {}; liftLogs.filter((l) => MAIN_LIFTS.includes(l.exercise)).forEach((l) => { (byLift[l.exercise] = byLift[l.exercise] || []).push({ date: fmtShort(l.date), iso: l.date, e1rm: l.e1rm }); });
   Object.keys(byLift).forEach((k) => byLift[k].sort((a, b) => a.iso.localeCompare(b.iso)));
+  // Merge every lift onto one shared, date-sorted axis so the multi-line chart aligns
+  // (giving each recharts <Line> its own data array misaligns/drops points once lifts
+  // are logged on different days via the A/B/C rotation). One row per logged date.
+  const strengthLifts = MAIN_LIFTS.filter((n) => byLift[n] && byLift[n].length);
+  const dateMap = {}; strengthLifts.forEach((n) => byLift[n].forEach((d) => { dateMap[d.iso] = d.date; }));
+  const strengthSeries = Object.keys(dateMap).sort().map((isoD) => { const row = { date: dateMap[isoD], iso: isoD }; strengthLifts.forEach((n) => { const hit = byLift[n].find((d) => d.iso === isoD); if (hit) row[n] = hit.e1rm; }); return row; });
   const body = bodyLogs.map((b) => ({ date: fmtShort(b.date), weight: b.weightKg, bf: b.bodyFatPct }));
   // End the trend at the current profile so edits to weight/body-fat show up even
   // without a fresh measurement log (keeps lean-mass consistent with the profile).
@@ -932,7 +938,7 @@ function buildProgress(plan, currentWeek, liftLogs, bodyLogs, runLogs = [], vo2L
   const vo2 = [...vo2Logs].sort((a, b) => a.date.localeCompare(b.date)).map((v) => ({ date: fmtShort(v.date), vo2: v.vo2max }));
   // Weekly training load (CTL proxy already per-week)
   const load = running.map((r) => ({ week: r.week, load: r.load }));
-  return { running, longRun, strength: byLift, body, pace, vo2, load };
+  return { running, longRun, strength: byLift, strengthSeries, strengthLifts, body, pace, vo2, load };
 }
 function buildAlerts(recovery, load, readiness, missedKey, holidayActive, shoeAlerts = []) {
   const alerts = [];
@@ -1163,7 +1169,7 @@ function reducer(core, action) {
     case "HealthUpdated": return { ...core, health: { ...(core.health || {}), ...action.health } };
     case "CheckinSaved": { const d = action.date || new Date().toISOString().slice(0, 10); return { ...core, recoveryInputs: { ...core.recoveryInputs, ...action.inputs }, recoveryLogs: [{ date: d, ...action.inputs }, ...(core.recoveryLogs || []).filter((r) => r.date !== d)], lastCheckinDate: action.date }; }
     case "RecoverySaved": { const d = action.date || new Date().toISOString().slice(0, 10); return { ...core, recoveryInputs: { ...core.recoveryInputs, ...action.inputs }, recoveryLogs: [{ date: d, ...action.inputs }, ...(core.recoveryLogs || []).filter((r) => r.date !== d)] }; }
-    case "BodyLogged": { const measurements = action.measurements ? { ...core.profile.measurements, ...action.measurements } : core.profile.measurements; const bf = (action.bodyFatPct && action.bodyFatPct > 0) ? action.bodyFatPct : (navyBodyFat({ ...core.profile, measurements }) ?? core.profile.bodyFatPct); return { ...core, profile: { ...core.profile, weightKg: action.weightKg, bodyFatPct: bf, measurements }, bodyLogs: [...core.bodyLogs, { id: uid(), source: "manual", date: action.date, weightKg: action.weightKg, bodyFatPct: bf }] }; }
+    case "BodyLogged": { const measurements = action.measurements ? { ...core.profile.measurements, ...action.measurements } : core.profile.measurements; const bf = (action.bodyFatPct && action.bodyFatPct > 0) ? action.bodyFatPct : (navyBodyFat({ ...core.profile, measurements }) ?? core.profile.bodyFatPct); return { ...core, profile: { ...core.profile, weightKg: action.weightKg, bodyFatPct: bf, measurements }, bodyLogs: [...core.bodyLogs.filter((b) => b.date !== action.date), { id: uid(), source: "manual", date: action.date, weightKg: action.weightKg, bodyFatPct: bf }].sort((a, b) => a.date.localeCompare(b.date)) }; }
     case "ProfileUpdated": return { ...core, profile: { ...core.profile, ...action.profile } };
     case "RecoveryUpdated": return { ...core, recoveryInputs: { ...core.recoveryInputs, ...action.inputs } };
     case "SleepLogged": return { ...core, recoveryInputs: { ...core.recoveryInputs, sleepHours: action.hours, sleepQuality: action.quality } };
@@ -1348,6 +1354,7 @@ function StrengthSessionLog({ ss, dispatch, date, units = "metric" }) {
     ? { name: it.name, timed: true, sets: Array.from({ length: it.sets }, () => ({ time: String(it.reps) })) }
     : { name: it.name, timed: false, sets: Array.from({ length: it.sets }, () => ({ weight: uWt(it.weightKg || 0, U), reps: repNum(it.reps) })) }));
   const [notes, setNotes] = useState(""); const [done, setDone] = useState(false);
+  const [openGroups, setOpenGroups] = useState({ Prehab: false, Compound: true, Accessory: false });
   const updSet = (i, si, k, v) => setEx(ex.map((e, j) => (j === i ? { ...e, sets: e.sets.map((s, m) => (m === si ? { ...s, [k]: (k === "time" ? v : parseFloat(v)) } : s)) } : e)));
   const setName = (i, name) => setEx(ex.map((e, j) => (j === i ? { ...e, name } : e)));
   const submit = () => {
@@ -1357,17 +1364,26 @@ function StrengthSessionLog({ ss, dispatch, date, units = "metric" }) {
   return (<Card>
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><Eyebrow>Strength session {ss.session ? "- " + ss.session : ""} - {ss.scheme}</Eyebrow></div>
     {ss.autoReg && (<div style={{ marginTop: 8, padding: "8px 10px", background: C.amber + "1A", border: `1px solid ${C.amber}55`, borderRadius: 8, fontSize: 11.5, color: C.amber, fontWeight: 600 }}>{ss.autoReg}</div>)}
-    {items.map((it, i) => { const e = ex[i]; const header = i === 0 || items[i - 1].group !== it.group; return (<div key={i}>
-      {header && <div style={{ display: "flex", alignItems: "center", gap: 6, margin: "14px 0 8px" }}><span style={{ width: 7, height: 7, borderRadius: 99, background: it.color }} /><span style={{ color: it.color, fontSize: 11.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>{it.group}</span></div>}
-      <div style={{ background: C.surface2, borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
-        {it.alts ? (<div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}><select value={e.name} onChange={(ev) => setName(i, ev.target.value)} style={{ ...inputStyle, fontWeight: 700, padding: "6px 8px", flex: 1 }}>{it.alts.map((o) => <option key={o} value={o}>{o}</option>)}</select><span style={{ color: C.faint, fontSize: 10.5, whiteSpace: "nowrap" }}>swap</span></div>) : (<div style={{ fontSize: 13.5, fontWeight: 700 }}>{it.name}</div>)}
-        <div style={{ color: C.faint, fontSize: 11.5, marginBottom: 8 }}>{it.presc}</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{e.sets.map((s, si) => (<div key={si} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ color: C.faint, fontSize: 11.5, width: 42 }}>Set {si + 1}</span>
-          {it.timed ? (<><Timer size={14} color={C.teal} /><input type="text" value={s.time} onChange={(ev) => updSet(i, si, "time", ev.target.value)} style={{ ...inputStyle, flex: 1 }} placeholder="e.g. 30s" /></>) : (<><input type="number" value={s.weight} step="2.5" onChange={(ev) => updSet(i, si, "weight", ev.target.value)} style={{ ...inputStyle, flex: 1 }} placeholder={wtU(U)} /><input type="number" value={s.reps} onChange={(ev) => updSet(i, si, "reps", ev.target.value)} style={{ ...inputStyle, width: 80 }} placeholder="reps" /></>)}
-        </div>))}</div>
-      </div>
-    </div>); })}
+    {(() => {
+      const groups = []; items.forEach((it, i) => { const g = groups.find((x) => x.name === it.group); if (g) g.idx.push(i); else groups.push({ name: it.group, color: it.color, idx: [i] }); });
+      return groups.map((g) => { const open = openGroups[g.name]; return (<div key={g.name}>
+        <button onClick={() => setOpenGroups({ ...openGroups, [g.name]: !open })} style={{ cursor: "pointer", width: "100%", background: "transparent", border: "none", padding: 0, margin: "14px 0 8px", display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ width: 7, height: 7, borderRadius: 99, background: g.color }} />
+          <span style={{ color: g.color, fontSize: 11.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>{g.name}</span>
+          <span style={{ color: C.faint, fontSize: 11, fontWeight: 600 }}>{g.idx.length}</span>
+          <ChevronRight size={16} color={C.faint} style={{ marginLeft: "auto", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }} />
+        </button>
+        {open && g.idx.map((i) => { const it = items[i]; const e = ex[i]; return (
+          <div key={i} style={{ background: C.surface2, borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+            {it.alts ? (<div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}><select value={e.name} onChange={(ev) => setName(i, ev.target.value)} style={{ ...inputStyle, fontWeight: 700, padding: "6px 8px", flex: 1 }}>{it.alts.map((o) => <option key={o} value={o}>{o}</option>)}</select><span style={{ color: C.faint, fontSize: 10.5, whiteSpace: "nowrap" }}>swap</span></div>) : (<div style={{ fontSize: 13.5, fontWeight: 700 }}>{it.name}</div>)}
+            <div style={{ color: C.faint, fontSize: 11.5, marginBottom: 8 }}>{it.presc}</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{e.sets.map((s, si) => (<div key={si} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span style={{ color: C.faint, fontSize: 11.5, width: 42 }}>Set {si + 1}</span>
+              {it.timed ? (<><Timer size={14} color={C.teal} /><input type="text" value={s.time} onChange={(ev) => updSet(i, si, "time", ev.target.value)} style={{ ...inputStyle, flex: 1 }} placeholder="e.g. 30s" /></>) : (<><input type="number" value={s.weight} step="2.5" onChange={(ev) => updSet(i, si, "weight", ev.target.value)} style={{ ...inputStyle, flex: 1 }} placeholder={wtU(U)} /><input type="number" value={s.reps} onChange={(ev) => updSet(i, si, "reps", ev.target.value)} style={{ ...inputStyle, width: 80 }} placeholder="reps" /></>)}
+            </div>))}</div>
+          </div>); })}
+      </div>); });
+    })()}
     <div style={{ marginTop: 8 }}><Field label="Session notes" type="text" value={notes} onChange={setNotes} /></div>
     <button onClick={submit} style={btn(C.violet)}><Plus size={15} /> {done ? "Logged" : "Log strength session"}</button>
     <div style={{ color: C.faint, fontSize: 11.5, marginTop: 8 }}>Compounds are set from your 1RM and ramp each week, easing off when recovery is low. Accessories use double progression - work up to the top of the rep range across sessions, then the weight goes up (+2.5 kg upper / +5 kg lower). Timed moves log a duration.</div>
@@ -1401,7 +1417,9 @@ function WorkoutDetails({ T, workout, dispatch, onBack }) {
 /* =========================== RECOVERY =========================== */
 function RecoveryView({ T, core, dispatch, onBack }) {
   const r = T.recovery, load = T.trainingLoad, ri = core.recoveryInputs;
+  const U = core.profile.units || "metric"; const pm = core.profile.measurements || {};
   const [draft, setDraft] = useState({ sleepHours: ri.sleepHours, sleepQuality: ri.sleepQuality, hrv: ri.hrv, restingHr: ri.restingHr, subjectiveFatigue: ri.subjectiveFatigue });
+  const [wIn, setWIn] = useState({ weightKg: core.profile.weightKg || 0, neck: pm.neck || 0, waist: pm.waist || 0 });
   const [saved, setSaved] = useState(true);
   const set = (patch) => { setDraft({ ...draft, ...patch }); setSaved(false); };
   const dirty = !saved && JSON.stringify({ sleepHours: ri.sleepHours, sleepQuality: ri.sleepQuality, hrv: ri.hrv, restingHr: ri.restingHr, subjectiveFatigue: ri.subjectiveFatigue }) !== JSON.stringify(draft);
@@ -1419,12 +1437,21 @@ function RecoveryView({ T, core, dispatch, onBack }) {
       <Slider icon={Activity} label="Resting HR" value={draft.restingHr} min={38} max={70} step={1} unit="bpm" color={C.ember} onChange={(v) => set({ restingHr: v })} />
       <Slider icon={Gauge} label="Subjective fatigue" value={draft.subjectiveFatigue} min={1} max={10} step={1} unit="/10" color={C.amber} onChange={(v) => set({ subjectiveFatigue: v })} />
       <Card style={{ borderColor: C.line }}>
+        <Eyebrow color={C.teal}>Weigh-in</Eyebrow>
+        <div style={{ fontSize: 12.5, color: C.dim, marginTop: 8 }}>Recorded with your check-in to track your weight trend. Neck & waist are optional - add them to refine your body-fat estimate.</div>
+        <div style={{ marginTop: 10 }}>
+          <Field label={`Weight (${wtU(U)})`} value={uWt(wIn.weightKg, U)} step="0.1" onChange={(v) => { setWIn({ ...wIn, weightKg: toKg(v, U) }); setSaved(false); }} />
+          <Field label="Neck - optional (cm)" value={wIn.neck || 0} step="0.5" onChange={(v) => { setWIn({ ...wIn, neck: v }); setSaved(false); }} />
+          <Field label="Waist - optional (cm)" value={wIn.waist || 0} step="0.5" onChange={(v) => { setWIn({ ...wIn, waist: v }); setSaved(false); }} />
+        </div>
+      </Card>
+      <Card style={{ borderColor: C.line }}>
         <Eyebrow color={C.rose}>Health status</Eyebrow>
         <div style={{ fontSize: 12.5, color: C.dim, marginTop: 8 }}>Flag illness or injury and the plan eases off automatically for ~10 days. Turn it off once you have recovered.</div>
         <div style={{ display: "flex", gap: 8, marginTop: 12 }}>{[{ k: "illness", label: "Ill" }, { k: "injury", label: "Injured" }].map((x) => { const on = core.health && core.health[x.k]; return (<button key={x.k} onClick={() => dispatch({ type: "HealthUpdated", health: { [x.k]: !on } })} style={{ flex: 1, padding: "10px", borderRadius: 10, cursor: "pointer", fontSize: 13, fontWeight: 700, border: `1px solid ${on ? C.rose : C.line}`, background: on ? C.rose + "1A" : C.surface2, color: on ? C.rose : C.dim }}>{on ? x.label + ": ON" : x.label}</button>); })}</div>
       </Card>
-      <button onClick={() => { dispatch({ type: "CheckinSaved", inputs: draft, date: T.currentDate }); setSaved(true); }} style={btn(C.teal)}><CheckCircle2 size={16} /> Save today's check-in</button>
-      <div style={{ color: C.faint, fontSize: 11.5 }}>Metrics aren't logged until you save. Saving recalculates your recovery score and refreshes the dashboard.</div>
+      <button onClick={() => { dispatch({ type: "CheckinSaved", inputs: draft, date: T.currentDate }); if (wIn.weightKg > 0) { const meas = {}; if (wIn.neck > 0) meas.neck = wIn.neck; if (wIn.waist > 0) meas.waist = wIn.waist; dispatch({ type: "BodyLogged", date: T.currentDate, weightKg: wIn.weightKg, measurements: Object.keys(meas).length ? meas : undefined }); } setSaved(true); }} style={btn(C.teal)}><CheckCircle2 size={16} /> Save today's check-in</button>
+      <div style={{ color: C.faint, fontSize: 11.5 }}>Metrics aren't logged until you save. Saving recalculates your recovery score, records your weigh-in, and refreshes the dashboard.</div>
     </div></Card>
   </div>);
 }
@@ -1478,16 +1505,10 @@ function RaceView({ T, dispatch, go }) {
         <div style={{ marginTop: 10 }}><Eyebrow>Gel schedule</Eyebrow><div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>{f.schedule.map((s) => <Row key={s.gel} left={`Gel ${s.gel}`} right={s.atClock} sub={`${s.atMin} min - ${f.gelCarbs} g carbs`} />)}</div></div>
         <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>{T.carb && <Row left="Carb loading" right={`${T.carb.dailyGrams} g/day`} sub={`${T.carb.days} days - ${T.carb.perKg} g/kg - ${T.carb.totalGrams} g total`} />}<Row left="Fluid" right={`${f.fluidPerHr} ml/hr`} /><Row left="Sodium" right={`${f.sodiumPerHr} mg/hr`} /></div>
       </>)}</Card>
-    <Card><Eyebrow>B-race recovery protocol</Eyebrow><div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>{Object.entries(B_RACE_RECOVERY).map(([k, v]) => <Row key={k} left={k} right={`${v} recovery`} />)}</div><div style={{ color: C.faint, fontSize: 11.5, marginTop: 8 }}>Long runs and quality sessions are replaced intelligently during B-race weeks.</div></Card>
   </div>);
 }
 
-/* =========================== PROGRESS (+ body log) =========================== */
-function BodyLogForm({ core, dispatch }) {
-  const U = core.profile.units || "metric";
-  const [d, setD] = useState({ weightKg: core.profile.weightKg, bodyFatPct: core.profile.bodyFatPct });
-  return (<Card><Eyebrow>Log body composition</Eyebrow><div style={{ marginTop: 10 }}><Field label={`Weight (${wtU(U)})`} value={uWt(d.weightKg, U)} step="0.1" onChange={(v) => setD({ ...d, weightKg: toKg(v, U) })} /><Field label="Body fat (%)" value={d.bodyFatPct} step="0.1" onChange={(v) => setD({ ...d, bodyFatPct: v })} /><button onClick={() => dispatch({ type: "BodyLogged", date: iso(new Date()), weightKg: d.weightKg, bodyFatPct: d.bodyFatPct })} style={btn(C.teal)}><Plus size={15} /> Log measurement</button></div></Card>);
-}
+/* =========================== PROGRESS =========================== */
 function ProgressView({ T, core, dispatch }) {
   const [tab, setTab] = useState("Running"); const p = T.progress; const U = core.profile.units || "metric";
   const oneRM = core.profile.oneRM, bw = core.profile.weightKg || 1;
@@ -1514,13 +1535,13 @@ function ProgressView({ T, core, dispatch }) {
       <Card><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><Eyebrow>Fitness, fatigue & form</Eyebrow><Pill color={STATUS_COLOR[T.trainingLoad.category]}>{T.trainingLoad.category}</Pill></div><div style={{ height: 180, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><AreaChart data={loadSeries} margin={{ top: 4, right: 6, bottom: 0, left: -22 }}><defs><linearGradient id="ctl2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.sky} stopOpacity={0.35} /><stop offset="100%" stopColor={C.sky} stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke={C.line} strokeDasharray="3 3" vertical={false} /><XAxis dataKey="label" hide /><YAxis tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: C.surface2, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 }} /><ReferenceLine y={0} stroke={C.line} /><Area type="monotone" dataKey="ctl" name="Fitness (CTL)" stroke={C.sky} fill="url(#ctl2)" strokeWidth={2} /><Line type="monotone" dataKey="atl" name="Fatigue (ATL)" stroke={C.ember} dot={false} strokeWidth={2} /><Line type="monotone" dataKey="tsb" name="Form (TSB)" stroke={C.teal} dot={false} strokeWidth={2} strokeDasharray="4 3" /></AreaChart></ResponsiveContainer></div><div style={{ color: C.faint, fontSize: 11, marginTop: 6 }}>Fitness rising with form recovering into race week is the goal.</div></Card>
     </>)}
     {tab === "Strength" && (<>
-      <Card><Eyebrow>Estimated 1RM progression</Eyebrow><div style={{ height: 220, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><LineChart margin={{ top: 4, right: 6, bottom: 0, left: -24 }}><CartesianGrid stroke={C.line} strokeDasharray="3 3" vertical={false} /><XAxis dataKey="date" type="category" allowDuplicatedCategory={false} tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: C.surface2, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 }} />{Object.entries(p.strength).map(([name, data], i) => (<Line key={name} data={data.map((d) => ({ ...d, e1rm: uWt(d.e1rm, U) }))} dataKey="e1rm" name={name} stroke={[C.ember, C.violet, C.sky, C.teal][i % 4]} dot={false} strokeWidth={2} />))}</LineChart></ResponsiveContainer></div><div style={{ display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap" }}>{Object.keys(p.strength).map((name, i) => <span key={name} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: C.dim }}><span style={{ width: 9, height: 3, background: [C.ember, C.violet, C.sky, C.teal][i % 4] }} />{name}</span>)}</div></Card>
+      <Card><Eyebrow>Estimated 1RM progression</Eyebrow>{p.strengthLifts && p.strengthLifts.length && p.strengthSeries.length ? (<><div style={{ height: 220, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><LineChart data={p.strengthSeries.map((r) => { const o = { date: r.date }; p.strengthLifts.forEach((n) => { if (r[n] != null) o[n] = uWt(r[n], U); }); return o; })} margin={{ top: 4, right: 6, bottom: 0, left: -24 }}><CartesianGrid stroke={C.line} strokeDasharray="3 3" vertical={false} /><XAxis dataKey="date" tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={["dataMin - 5", "dataMax + 5"]} tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: C.surface2, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 }} />{p.strengthLifts.map((name, i) => (<Line key={name} type="monotone" dataKey={name} name={name} stroke={[C.ember, C.violet, C.sky, C.teal][i % 4]} dot={{ r: 2 }} strokeWidth={2} connectNulls />))}</LineChart></ResponsiveContainer></div><div style={{ display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap" }}>{p.strengthLifts.map((name, i) => <span key={name} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: C.dim }}><span style={{ width: 9, height: 3, background: [C.ember, C.violet, C.sky, C.teal][i % 4] }} />{name}</span>)}</div></>) : (<div style={{ color: C.faint, fontSize: 12.5, marginTop: 10 }}>Log your main barbell lifts (squat, deadlift, bench, overhead press) and your estimated 1RM trend will build here.</div>)}</Card>
       <Card><Eyebrow>Current 1RMs ({wtU(U)})</Eyebrow><div style={{ height: 180, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><BarChart data={rmBars.map((b) => ({ ...b, kg: uWt(b.kg, U) }))} margin={{ top: 4, right: 6, bottom: 0, left: -24 }}><CartesianGrid stroke={C.line} strokeDasharray="3 3" vertical={false} /><XAxis dataKey="lift" tick={{ fill: C.faint, fontSize: 11 }} axisLine={false} tickLine={false} /><YAxis tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: C.surface2, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 }} /><Bar dataKey="kg" name={wtU(U)} fill={C.violet} radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer></div></Card>
       <Card><Eyebrow>Strength-to-bodyweight</Eyebrow><div style={{ display: "flex", gap: 18, marginTop: 10, flexWrap: "wrap" }}>{rmBars.map((b) => <Stat key={b.lift} label={b.lift} value={b.x + "x"} color={b.x >= 1.5 ? C.teal : b.x >= 1 ? C.sky : C.amber} />)}</div><div style={{ color: C.faint, fontSize: 11.5, marginTop: 8 }}>Relative strength matters more than absolute load for a runner. Total {totalRel}x bodyweight - lower numbers preserve a lighter race weight.</div></Card>
     </>)}
     {tab === "Body" && (<><Card><Eyebrow>Body composition trend</Eyebrow><div style={{ height: 220, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><LineChart data={p.body.map((d) => ({ ...d, weight: uWt(d.weight, U) }))} margin={{ top: 4, right: 6, bottom: 0, left: -24 }}><CartesianGrid stroke={C.line} strokeDasharray="3 3" vertical={false} /><XAxis dataKey="date" tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis yAxisId="w" domain={["dataMin - 1", "dataMax + 1"]} tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis yAxisId="bf" orientation="right" tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: C.surface2, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 }} /><Line yAxisId="w" dataKey="weight" name="Weight" stroke={C.teal} dot={false} strokeWidth={2} /><Line yAxisId="bf" dataKey="bf" name="Body fat" stroke={C.amber} dot={false} strokeWidth={2} strokeDasharray="4 3" /></LineChart></ResponsiveContainer></div></Card>
       <Card><Eyebrow>Lean mass trend</Eyebrow><div style={{ height: 180, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><AreaChart data={leanSeries.map((d) => ({ ...d, lean: uWt(d.lean, U) }))} margin={{ top: 4, right: 6, bottom: 0, left: -24 }}><defs><linearGradient id="lean" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.sky} stopOpacity={0.35} /><stop offset="100%" stopColor={C.sky} stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke={C.line} strokeDasharray="3 3" vertical={false} /><XAxis dataKey="date" tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis domain={["dataMin - 1", "dataMax + 1"]} tick={{ fill: C.faint, fontSize: 10 }} axisLine={false} tickLine={false} /><Tooltip contentStyle={{ background: C.surface2, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 }} /><Area type="monotone" dataKey="lean" name={`lean ${wtU(U)}`} stroke={C.sky} fill="url(#lean)" strokeWidth={2} /></AreaChart></ResponsiveContainer></div><div style={{ color: C.faint, fontSize: 11.5, marginTop: 6 }}>Holding lean mass while losing weight means you're losing fat, not muscle - exactly what you want into race weight.</div></Card>
-      <BodyLogForm core={core} dispatch={dispatch} /></>)}
+      <div style={{ color: C.faint, fontSize: 11.5, textAlign: "center", padding: "2px 4px" }}>Log your weight (and optional neck & waist) from the daily check-in to build these trends.</div></>)}
   </div>);
 }
 
@@ -1548,8 +1569,7 @@ function ProfileView({ core, dispatch, go, user = null, onChangePassword = null,
       <NavRow icon={Wind} label="Training paces" color={C.ember} onClick={() => go({ name: "paces" })} />
       <NavRow icon={Gauge} label="Help & how it works" color={C.sky} onClick={() => go({ name: "help" })} sub="What every number means + key terms" />
     </div></Card>
-    <button onClick={() => { if (typeof window === "undefined" || window.confirm("Start a blank profile? Your current data will be cleared.")) dispatch({ type: "StartFresh" }); }} style={btn(C.sky, true)}><User size={15} /> New blank athlete</button>
-    <button onClick={() => { if (typeof window === "undefined" || window.confirm("Reset to the demo athlete?")) dispatch({ type: "Reset" }); }} style={btn(C.rose, true)}><RefreshCw size={15} /> Reset to demo data</button>
+    <button onClick={() => { if (typeof window === "undefined") { dispatch({ type: "StartFresh" }); return; } if (!window.confirm("Reset all data?\n\nThis permanently clears your profile, training plan, recovery history, and every logged run and lift, then starts a fresh blank setup. Use this only to start over from scratch - it cannot be undone.")) return; if (!window.confirm("Are you sure? This wipes everything and cannot be undone.")) return; dispatch({ type: "StartFresh" }); }} style={btn(C.rose, true)}><RefreshCw size={15} /> Reset data</button>
     {(onChangePassword || onDeleteAccount) && (<Card style={{ borderColor: C.rose + "44" }}>
       <Eyebrow color={C.rose}>Account</Eyebrow>
       {user && user.email && <div style={{ color: C.dim, fontSize: 12.5, marginTop: 8 }}>Signed in as {user.email}</div>}
@@ -2080,6 +2100,8 @@ function runTests() {
   const avgState = deriveState(avgCore).todayState;
   ok("Paces use averaged VO2 (smooths spikes)", Math.abs(avgState.vo2ForPaces - (50 + 54 + 62) / 3) < 0.2, `${avgState.vo2ForPaces} vs latest ${avgState.vo2Logged}`);
   ok("VO2 max from setup feeds starting paces", deriveState({ ...core, vo2Logs: [], profile: { ...core.profile, vo2max: 55 } }).todayState.vo2ForPaces === 55);
+  // Strength progression series merges every lift onto one shared, date-sorted axis
+  ok("Strength progress merges lifts onto a shared date axis", (() => { const p = deriveState(core).todayState.progress; if (!p.strengthSeries.length || !p.strengthLifts.length) return false; const sorted = p.strengthSeries.map((r) => r.iso).every((d, i, a) => i === 0 || a[i - 1] <= d); const rowsHaveLifts = p.strengthSeries.some((r) => p.strengthLifts.some((n) => r[n] != null)); return sorted && rowsHaveLifts; })());
   ok("Manual methodology override is respected", deriveState({ ...core, profile: { ...core.profile, methodologyPref: "Norwegian" } }).todayState.methodology === "Norwegian");
   ok("Auto methodology flagged when not overridden", deriveState({ ...core, profile: { ...core.profile, methodologyPref: "Auto" } }).todayState.methodologyIsAuto === true);
   ok("B1: illness mode removes upcoming intensity", (() => { const ic = { ...core, health: { illness: true, injury: false } }; const t = deriveState(ic).todayState.currentDate; const hz = iso(addDays(new Date(t), 10)); const A = deriveState(ic).athleteState; return !A.currentPlan.weeks.flatMap((w) => w.days).some((d) => d.date >= t && d.date <= hz && (d.type === "Threshold" || d.type === "Intervals")); })());
