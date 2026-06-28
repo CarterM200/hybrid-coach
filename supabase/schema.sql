@@ -11,6 +11,13 @@ create table if not exists public.athlete_state (
 
 -- Row Level Security: every row belongs to exactly one user.
 alter table public.athlete_state enable row level security;
+-- FORCE applies RLS even to the table owner, so a misconfigured/elevated role can't
+-- bypass per-row isolation. With this on, only the policies below grant access.
+alter table public.athlete_state force row level security;
+
+-- Defence in depth: the anon (logged-out) role should never touch athlete data.
+revoke all on public.athlete_state from anon;
+grant select, insert, update, delete on public.athlete_state to authenticated;
 
 drop policy if exists "athlete_state_select_own" on public.athlete_state;
 create policy "athlete_state_select_own"
@@ -48,3 +55,10 @@ $$;
 
 revoke all on function public.delete_user() from public;
 grant execute on function public.delete_user() to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- VERIFY RLS IS LIVE  (run after the above; expect rowsecurity = true, forced = true)
+-- ---------------------------------------------------------------------------
+-- select relname, relrowsecurity as rls_on, relforcerowsecurity as rls_forced
+--   from pg_class where relname = 'athlete_state';
+-- select polname, cmd from pg_policies where tablename = 'athlete_state';
